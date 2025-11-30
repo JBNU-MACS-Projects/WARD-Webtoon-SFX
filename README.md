@@ -173,8 +173,7 @@ ward-ocr/
 
 ## Model Weight
 
-You can download the pre-trained weight via [HuggingFace](https://huggingface.co/KyungsuLee/WARD-Webtoon-SFX)
-
+You can download the pre-trained weight via [HuggingFace](https://huggingface.co/KyungsuLee/WARD-Webtoon-SFX/tree/main)
 
 -----
 
