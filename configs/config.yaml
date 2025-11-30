@@ -1,0 +1,83 @@
+project:
+  name: ward-ocr
+  version: 0.1
+  seed: 42
+  device: cuda
+  num_workers: 4
+
+data:
+  root_dir: ./data
+  train_real_path: ${data.root_dir}/raw/train
+  train_background_path: ${data.root_dir}/background
+  val_path: ${data.root_dir}/raw/val
+  font_dir: ${data.root_dir}/assets/fonts
+  text_corpus_path: ${data.root_dir}/assets/sfx_source/onomatopoeia.txt
+  img_size: [640, 640]
+  batch_size: 8
+
+sfx_engine:
+  canvas_size: ${data.img_size}
+  font_size_min: 40
+  font_size_max: 150
+  max_rotation: 30
+  max_perspective: 0.2
+  max_warp: 0.2
+  blur_radius_max: 2.0
+  color_jitter: 0.2
+  stroke_width_max: 8
+
+model:
+  encoder:
+    in_channels: 3
+    base_channels: 64
+    ash_percentile: 90
+    ash_scaling: true
+
+  ocr_net:
+    hidden_size: 256
+    num_classes: 2350
+    max_seq_len: 25
+    use_ctc: true
+
+  texting_net:
+    time_steps: 1000
+    beta_start: 0.0001
+    beta_end: 0.02
+    unet_dim: 64
+    unet_dim_mults: [1, 2, 4, 8]
+    dropout: 0.1
+
+train:
+  mode: joint
+  stage1_iters: 200000
+  stage2_iters: 200000
+  val_interval: 1000
+  save_interval: 5000
+  print_interval: 100
+  resume_path: null
+
+  optimizer:
+    name: adamw
+    lr_backbone: 0.0001
+    lr_head: 0.0002
+    weight_decay: 0.0001
+    betas: [0.9, 0.999]
+    clip_grad_norm: 1.0
+
+  scheduler:
+    type: cosine
+    warmup_steps: 10000
+
+  loss_weights:
+    lambda_det: 1.0
+    lambda_rec: 1.0
+    lambda_perc: 0.1
+    lambda_gen: 0.05
+    lambda_w: 0.5
+    lambda_h: 0.5
+
+wandb:
+  enabled: true
+  project: ward-ocr
+  entity: null
+  name: null
