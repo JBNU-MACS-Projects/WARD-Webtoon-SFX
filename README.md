@@ -171,6 +171,21 @@ ward-ocr/
 -----
 
 
+## Model Weight
+
+You can download the pre-trained weight via [HuggingFace](https://huggingface.co/KyungsuLee/WARD-Webtoon-SFX)
+
+
+-----
+
+
+## Datasets
+
+You can download the pre-trained weight via [HuggingFace](https://huggingface.co/datasets/KyungsuLee/WARD-Webtoon-SFX-dataset)
+
+-----
+
+
 ## 📄 License
 
 This project is licensed under the **MIT License**. See [LICENSE](LICENSE) for details.

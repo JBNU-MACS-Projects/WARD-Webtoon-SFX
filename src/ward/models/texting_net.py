@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
+import math
 from einops import rearrange
+from typing import Optional, List
 
 
 class CrossAttention(nn.Module):
     """
     Multi-Head Cross-Attention optimized with torch.einsum.
-    Injects global context (Conditions) into spatial features.
     """
 
     def __init__(self, dim: int, context_dim: int, heads: int = 4, dim_head: int = 64):
@@ -20,129 +21,212 @@ class CrossAttention(nn.Module):
         self.to_out = nn.Conv2d(inner_dim, dim, 1)
 
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, H, W) - Query source
-        context: (B, D) - Key/Value source
-        """
         b, c, h, w = x.shape
-
-        # Prepare Q
         q = self.to_q(x)
         q = rearrange(q, 'b (h d) x y -> b h (x y) d', h=self.heads)
 
-        # Prepare K, V (Broadcasting context across spatial dim not needed here, done in attn)
         kv = self.to_kv(context).chunk(2, dim=-1)
         k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), kv)
 
-        # Attention Score: Q * K^T
         sim = torch.einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
         attn = sim.softmax(dim=-1)
 
-        # Aggregate: Attn * V
         out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', x=h, y=w)
 
         return self.to_out(out) + x
 
 
+class ResBlockWithTime(nn.Module):
+    """ ResNet Block with Time Embedding Injection """
+
+    def __init__(self, dim, dim_out, time_emb_dim=None, groups=8):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, dim_out * 2)
+        ) if time_emb_dim else None
+
+        self.block1 = nn.Sequential(
+            nn.Conv2d(dim, dim_out, 3, padding=1),
+            nn.GroupNorm(groups, dim_out),
+            nn.SiLU()
+        )
+        self.block2 = nn.Sequential(
+            nn.Conv2d(dim_out, dim_out, 3, padding=1),
+            nn.GroupNorm(groups, dim_out),
+            nn.SiLU()
+        )
+        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+
+    def forward(self, x, time_emb=None):
+        scale_shift = None
+        if self.mlp is not None and time_emb is not None:
+            time_emb = self.mlp(time_emb)
+            time_emb = rearrange(time_emb, 'b c -> b c 1 1')
+            scale_shift = time_emb.chunk(2, dim=1)
+
+        h = self.block1(x)
+        if scale_shift is not None:
+            scale, shift = scale_shift
+            h = h * (scale + 1) + shift
+
+        h = self.block2(h)
+        return h + self.res_conv(x)
+
+
+class Downsample(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.Conv2d(dim, dim, 4, 2, 1)  # Stride 2 reduces spatial dim
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Upsample(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.Conv2d(dim, dim, 3, padding=1)
+        self.up = nn.Upsample(scale_factor=2, mode="nearest")
+
+    def forward(self, x):
+        return self.conv(self.up(x))
+
+
 class DiffusionUNet(nn.Module):
     """
-    DDPM U-Net with Global Context Injection via Cross-Attention.
+    Correctly structured U-Net with Down/Up sampling logic fixed.
     """
 
-    def __init__(self, dim: int, channels: int = 3, cond_dim: int = 2048):
+    def __init__(self, dim: int = 64, channels: int = 3, cond_dim: int = 2048):
         super().__init__()
+
+        # Initial Conv
         self.init_conv = nn.Conv2d(channels, dim, 7, padding=3)
 
-        # Sinusoidal Time Embedding
+        # Time Embedding
         time_dim = dim * 4
         self.time_mlp = nn.Sequential(
             nn.Linear(1, dim),
             nn.GELU(),
-            nn.Linear(dim, time_dim)
+            nn.Linear(dim, time_dim),
         )
 
-        # Down-sample Block with Time Injection
-        self.down1 = self._make_res_block(dim, dim * 2, time_dim)
-        self.attn1 = CrossAttention(dim * 2, cond_dim)  # Inject Style Z
-        self.down2 = self._make_res_block(dim * 2, dim * 4, time_dim)
+        # --- Down 1: 64 -> 128 ---
+        self.down1 = nn.ModuleList([
+            ResBlockWithTime(dim, dim, time_dim),
+            ResBlockWithTime(dim, dim, time_dim),
+            Downsample(dim)  # Output channels: dim, Size: /2
+        ])
 
-        # Bottleneck
-        self.mid_block1 = self._make_res_block(dim * 4, dim * 4, time_dim)
-        self.mid_attn = CrossAttention(dim * 4, cond_dim)
-        self.mid_block2 = self._make_res_block(dim * 4, dim * 4, time_dim)
+        # --- Down 2: 64 -> 128 ---
+        # Note: Input is dim (64), we expand to dim*2 (128)
+        self.down2 = nn.ModuleList([
+            ResBlockWithTime(dim, dim * 2, time_dim),
+            ResBlockWithTime(dim * 2, dim * 2, time_dim),
+            CrossAttention(dim * 2, cond_dim),
+            Downsample(dim * 2)  # Output channels: dim*2, Size: /4
+        ])
 
-        # Up-sample Block
-        self.up1 = self._make_res_block(dim * 8, dim * 2, time_dim)  # Concat skip
-        self.attn_up1 = CrossAttention(dim * 2, cond_dim)
-        self.up2 = self._make_res_block(dim * 4, dim, time_dim)
+        # --- Mid: 128 -> 256 -> 128 ---
+        mid_dim = dim * 4  # Expand to 256
+        self.mid_block1 = ResBlockWithTime(dim * 2, mid_dim, time_dim)
+        self.mid_attn = CrossAttention(mid_dim, cond_dim)
+        self.mid_block2 = ResBlockWithTime(mid_dim, mid_dim, time_dim)
 
-        self.final = nn.Conv2d(dim, channels, 1)
+        # --- Up 2: 256 -> 128 ---
+        # Input: mid_dim (256). Skip from Down 2: dim*2 (128).
+        self.up2 = nn.ModuleList([
+            Upsample(mid_dim),  # 256 -> 256 (Size * 2)
+            ResBlockWithTime(mid_dim + dim * 2, dim * 2, time_dim),  # Cat(256+128) -> 128
+            ResBlockWithTime(dim * 2, dim * 2, time_dim),
+            CrossAttention(dim * 2, cond_dim)
+        ])
 
-    def _make_res_block(self, in_c, out_c, time_c):
-        return ResBlockWithTime(in_c, out_c, time_c)
+        # --- Up 1: 128 -> 64 ---
+        # Input: dim*2 (128). Skip from Down 1: dim (64).
+        self.up1 = nn.ModuleList([
+            Upsample(dim * 2),  # 128 -> 128 (Size * 2)
+            ResBlockWithTime(dim * 2 + dim, dim, time_dim),  # Cat(128+64) -> 64
+            ResBlockWithTime(dim, dim, time_dim)
+        ])
 
-    def forward(self, x: torch.Tensor, time: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        # t: (B,) -> (B, 1)
-        t_emb = self.time_mlp(time.float().unsqueeze(-1))
+        # Final: 64 -> 3
+        # Input: dim (64). Skip from Init: dim (64).
+        self.final_res = ResBlockWithTime(dim + dim, dim, time_dim)  # Cat(64+64) -> 64
+        self.final_conv = nn.Conv2d(dim, channels, 1)
 
-        # Cond: Global Average Pooling of Z -> (B, 2048)
-        cond_vec = rearrange(cond, 'b c h w -> b c (h w)').mean(dim=-1).unsqueeze(1)
+    def forward(self, x, time, cond=None):
+        # Time Embedding
+        t = self.time_mlp(time.float().unsqueeze(-1))
 
+        # Condition Z pooling
+        if cond is not None:
+            cond_vec = rearrange(cond, 'b c h w -> b c (h w)').mean(dim=-1).unsqueeze(1)
+
+        # 1. Init
         x = self.init_conv(x)
+        r_init = x.clone()  # Save for final skip
 
-        # Down
-        r1 = x
-        x = self.down1(x, t_emb)  # Down to dim*2
-        x = self.attn1(x, cond_vec)
-        r2 = x
-        x = self.down2(x, t_emb)  # Down to dim*4
+        # 2. Down 1
+        for block in self.down1:
+            if isinstance(block, Downsample):
+                r_down1 = x.clone()  # [Fix] Capture BEFORE downsampling
+                x = block(x)
+            else:
+                x = block(x, t)
 
-        # Mid
-        x = self.mid_block1(x, t_emb)
+        # 3. Down 2
+        for block in self.down2:
+            if isinstance(block, Downsample):
+                r_down2 = x.clone()  # [Fix] Capture BEFORE downsampling
+                x = block(x)
+            elif isinstance(block, CrossAttention):
+                x = block(x, cond_vec)
+            else:
+                x = block(x, t)
+
+        # 4. Mid
+        x = self.mid_block1(x, t)
         x = self.mid_attn(x, cond_vec)
-        x = self.mid_block2(x, t_emb)
+        x = self.mid_block2(x, t)
 
-        # Up (Using simple concat for skip connection logic)
-        # Note: Actual U-Net requires proper sizing, using interpolate for simplicity here
-        x = F.interpolate(x, scale_factor=2)
-        x = torch.cat((x, r2), dim=1)
-        x = self.up1(x, t_emb)
-        x = self.attn_up1(x, cond_vec)
+        # 5. Up 2 (Concatenate with Down 2 output)
+        x = self.up2[0](x)  # Upsample
+        x = torch.cat((x, r_down2), dim=1)  # Concat with r_down2
+        x = self.up2[1](x, t)
+        x = self.up2[2](x, t)
+        x = self.up2[3](x, cond_vec)
 
-        x = F.interpolate(x, scale_factor=2)
-        x = torch.cat((x, r1), dim=1)
-        x = self.up2(x, t_emb)
+        # 6. Up 1 (Concatenate with Down 1 output)
+        x = self.up1[0](x)  # Upsample
+        x = torch.cat((x, r_down1), dim=1)  # Concat with r_down1
+        x = self.up1[1](x, t)
+        x = self.up1[2](x, t)
 
-        return self.final(x)
+        # Final
+        x = torch.cat((x, r_init), dim=1)
+        x = self.final_res(x, t)
 
-
-class ResBlockWithTime(nn.Module):
-    """ ResNet Block that accepts Time Embedding """
-
-    def __init__(self, in_c, out_c, time_c):
-        super().__init__()
-        self.conv = nn.Conv2d(in_c, out_c, 3, padding=1)
-        self.norm = nn.GroupNorm(8, out_c)
-        self.time_proj = nn.Linear(time_c, out_c)
-        self.act = nn.SiLU()
-
-    def forward(self, x, t_emb):
-        # Shift-and-Scale (AdaGN style) or just Add
-        h = self.conv(x)
-        h = self.norm(h)
-        # Add time embedding
-        scale = self.time_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
-        return self.act(h + scale)
+        return self.final_conv(x)
 
 
 class GenerativeTextingNet(nn.Module):
     def __init__(self, encoder: nn.Module, cfg):
         super().__init__()
         self.encoder = encoder
-        self.unet = DiffusionUNet(dim=64, cond_dim=2048)
+
+        # Access config via correct path
+        txt_cfg = cfg.model.texting_net
+
+        self.unet = DiffusionUNet(
+            dim=txt_cfg.unet_dim,
+            channels=3,
+            cond_dim=2048  # Matches encoder output dim
+        )
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, clean_img: torch.Tensor):
-        with torch.no_grad():  # Usually condition encoder is frozen or learned jointly
+        with torch.no_grad():
             cond, _ = self.encoder(clean_img)
         return self.unet(x_t, t, cond), cond
